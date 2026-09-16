@@ -6,6 +6,7 @@
   3) 最小包围圆(Welzl)
   4) 直径圆覆盖判定 + Jung定理分析
   5) 随机实验统计 r*/D 分布
+  6) 自动随机生成三组合法探测场景（不依赖外部场景文件）
 先算后画。
 """
 import pandas as pd
@@ -27,6 +28,7 @@ plt.rcParams['savefig.bbox'] = 'tight'
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 FIG_DIR = os.path.join(BASE_DIR, '图片')
 OUT_DIR = os.path.join(BASE_DIR, '结果')
+TARGET_RADIUS = 1800.0  # 题设目标区域半径（米）
 os.makedirs(FIG_DIR, exist_ok=True)
 os.makedirs(OUT_DIR, exist_ok=True)
 
@@ -252,33 +254,122 @@ def stats_print(name, arr):
           f"mean={arr.mean():.4f} std={arr.std(ddof=1):.4f} "
           f"CV={arr.std(ddof=1)/arr.mean():.4f} amplitude={arr.max()-arr.min():.4f}")
 
-# ---------- 示例场景(含真值, 验证用) ----------
-rng = np.random.default_rng(42)
+# ---------- 随机场景(含真值, 验证用) ----------
+# 默认使用系统熵，因此每次运行都会得到不同的探测点；设置环境变量
+# Q1_RANDOM_SEED 可以复现实验，例如 PowerShell 中：$env:Q1_RANDOM_SEED=2026。
+_seed_text = os.environ.get('Q1_RANDOM_SEED', '').strip()
+try:
+    RANDOM_SEED = int(_seed_text) if _seed_text else None
+except ValueError:
+    raise ValueError('环境变量 Q1_RANDOM_SEED 必须是整数')
+rng = np.random.default_rng(RANDOM_SEED)
 
-def make_scenario(G, S_list, seed=None):
-    """给定真值G与检测点, 生成带±1°误差的示向度(每点误差独立)"""
-    rr = np.random.default_rng(seed)
+
+def make_scenario(G, S_list, seed=None, rng=None):
+    """给定真值 G 与检测点，生成带 ±1° 误差的示向度。
+
+    ``rng`` 用于主程序的连续随机生成；保留 ``seed`` 参数以兼容旧代码。
+    """
+    if rng is None:
+        rng = np.random.default_rng(seed)
     bearings = []
     for S in S_list:
         true_deg = np.rad2deg(np.arctan2(G[1]-S[1], G[0]-S[0])) % 360
-        err = rr.uniform(-1.0, 1.0)
+        err = rng.uniform(-1.0, 1.0)
         bearings.append((true_deg + err) % 360)
     return bearings
 
-# 场景A: 2个检测点(四边形区域)
-G_A = np.array([300.0, 250.0])
-S_A = [np.array([-600.0, -200.0]), np.array([500.0, -400.0])]
-B_A = make_scenario(G_A, S_A, seed=1)
 
-# 场景B: 3个检测点(多边形区域)
-G_B = np.array([-200.0, 400.0])
-S_B = [np.array([300.0, -500.0]), np.array([-700.0, -100.0]), np.array([600.0, 300.0])]
-B_B = make_scenario(G_B, S_B, seed=2)
+def _circular_separations(angles_deg):
+    """返回一组角度的相邻圆周间隔（度）。"""
+    angles = np.sort(np.asarray(angles_deg, dtype=float) % 360.0)
+    if len(angles) < 2:
+        return np.array([], dtype=float)
+    return np.diff(np.r_[angles, angles[0] + 360.0])
 
-# 场景C: 4个检测点
-G_C = np.array([100.0, -300.0])
-S_C = [np.array([-500.0, 200.0]), np.array([400.0, 500.0]), np.array([800.0, -600.0]), np.array([-300.0, -700.0])]
-B_C = make_scenario(G_C, S_C, seed=3)
+
+def _random_detector_angles(n_points, rng):
+    """生成分布在真值周围的探测方向，避免近似平行导致区域无界/病态。"""
+    # 两条示向线取 55°--125° 的交会角，避开近似平行（0°或180°）；
+    # 3、4 个点则采用等角基准加小扰动，让探测点分布在真值四周。
+    base = rng.uniform(0.0, 360.0)
+    if n_points == 2:
+        return np.array([base, base + rng.uniform(55.0, 125.0)]) % 360.0
+    jitter = rng.uniform(-18.0, 18.0, n_points)
+    angles = (base + np.arange(n_points) * 360.0 / n_points + jitter) % 360.0
+    # 极小概率扰动使两个方向过近时重新采样。
+    while np.min(_circular_separations(angles)) < 35.0:
+        base = rng.uniform(0.0, 360.0)
+        jitter = rng.uniform(-18.0, 18.0, n_points)
+        angles = (base + np.arange(n_points) * 360.0 / n_points + jitter) % 360.0
+    return angles
+
+
+def generate_random_scenarios(rng=None, max_attempts=2000):
+    """随机生成三个满足定位条件的场景 A/B/C。
+
+    场景 A、B、C 分别含 2、3、4 个探测点。真值和探测点位于题设半径
+    1800 m 的目标圆域内，探测点到真值距离在 600--1200 m 之间，方位
+    分布充分分散；每个示向度加入 ±1° 测量误差。
+    函数只接受通过几何检查的结果：交会区域至少有 3 个顶点、有界、面积
+    为正，且真值位于区域内。这样下游直径、包围圆和绘图不会因随机退化而失败。
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    def point_in_polygon(verts, point):
+        inside = False
+        x, y = point
+        j = len(verts) - 1
+        for i in range(len(verts)):
+            xi, yi = verts[i]
+            xj, yj = verts[j]
+            if ((yi > y) != (yj > y)) and (
+                    x < (xj - xi) * (y - yi) / (yj - yi + 1e-30) + xi):
+                inside = not inside
+            j = i
+        return inside
+
+    scenarios = []
+    for tag, n_points in [('A', 2), ('B', 3), ('C', 4)]:
+        accepted = None
+        for _ in range(max_attempts):
+            # 在半径 900 m 的圆盘内均匀取真值，确保真值远离边界，
+            # 再将探测点限制在题设目标圆域内。
+            source_r = 900.0 * np.sqrt(rng.uniform())
+            source_theta = rng.uniform(0.0, 2.0 * np.pi)
+            G = source_r * np.array([np.cos(source_theta), np.sin(source_theta)])
+            directions = _random_detector_angles(n_points, rng)
+            distances = rng.uniform(600.0, 1200.0, size=n_points)
+            S_list = [G - distance * uvec(direction)
+                      for direction, distance in zip(directions, distances)]
+            if any(np.hypot(S[0], S[1]) > TARGET_RADIUS for S in S_list):
+                continue
+            B_list = make_scenario(G, S_list, rng=rng)
+            poly, unbounded = localization_polygon(S_list, B_list)
+            if unbounded or len(poly) < 3 or polygon_area(poly) <= 1e-6:
+                continue
+            if not point_in_polygon(poly, G):
+                continue
+            # 两点交会应为四边形；若随机误差使某条边冗余，重新采样。
+            if tag == 'A' and len(poly) != 4:
+                continue
+            accepted = dict(tag=tag, G=np.asarray(G, dtype=float),
+                            S=[np.asarray(S, dtype=float) for S in S_list],
+                            B=[float(b) for b in B_list])
+            break
+        if accepted is None:
+            raise RuntimeError(f'无法在 {max_attempts} 次尝试内生成场景{tag}，请调整随机范围')
+        scenarios.append(accepted)
+    return scenarios
+
+
+# 场景 A/B/C 每次由程序自动随机生成，不再依赖任何外部场景文件。
+_scenarios = generate_random_scenarios(rng)
+print(f'已生成随机场景 A/B/C（seed={RANDOM_SEED if RANDOM_SEED is not None else "系统熵"}）')
+G_A, S_A, B_A = _scenarios[0]['G'], _scenarios[0]['S'], _scenarios[0]['B']
+G_B, S_B, B_B = _scenarios[1]['G'], _scenarios[1]['S'], _scenarios[1]['B']
+G_C, S_C, B_C = _scenarios[2]['G'], _scenarios[2]['S'], _scenarios[2]['B']
 
 results = []
 scenario_rows = []
@@ -308,7 +399,9 @@ for tag, G, Ss, Bs in [('A', G_A, S_A, B_A), ('B', G_B, S_B, B_B), ('C', G_C, S_
           f"直径D={D_rc:.2f} 最小包围圆r*={rstar:.2f} r*/D={rstar/D_rc:.4f} "
           f"直径圆覆盖={cov} 真值在多边形内={G_in}")
     for i, (S, th) in enumerate(zip(Ss, Bs)):
-        scenario_rows.append(dict(场景=tag, 检测点编号=i+1, x=S[0], y=S[1], 示向度=round(th, 2)))
+        scenario_rows.append(dict(场景=tag, 检测点编号=i+1,
+                                 x=round(float(S[0]), 2), y=round(float(S[1]), 2),
+                                 示向度=round(float(th), 2)))
     vert_str = ';'.join(f'{v[0]:.2f},{v[1]:.2f}' for v in poly)
     scenario_rows.append(dict(场景=tag, 检测点编号='区域', x='', y='', 示向度='',
                               顶点=vert_str, 直径=round(D_rc, 2), 最小包围圆半径=round(rstar, 2),
@@ -328,14 +421,16 @@ cov_rect, m_rect, _ = coverage_by_diameter_circle(rect, D_rect, pair_rect)
 c_rect, r_rect = smallest_enclosing_circle(rect)
 print(f"矩形2x1: D={D_rect:.4f} r*={r_rect:.4f} 直径圆覆盖={cov_rect}")
 
-# 随机实验: k个检测点随机布设, 统计r*/D与覆盖比例
-np.random.seed(2026)
+# 随机实验: k个检测点随机布设, 统计r*/D与覆盖比例。
+# 与上面的三组示例场景使用独立随机流，保证示例坐标随机时箱线图仍可复现。
+experiment_rng = np.random.default_rng(2026)
 exp_rows = []
 for k in range(2, 7):
     rs = []
     for trial in range(1000):
-        G = np.array([rng.uniform(-1000, 1000), rng.uniform(-1000, 1000)])
-        Ss = [np.array([rng.uniform(-1500, 1500), rng.uniform(-1500, 1500)]) for _ in range(k)]
+        G = np.array([experiment_rng.uniform(-1000, 1000), experiment_rng.uniform(-1000, 1000)])
+        Ss = [np.array([experiment_rng.uniform(-1500, 1500),
+                        experiment_rng.uniform(-1500, 1500)]) for _ in range(k)]
         # 剔除与G重合或过近的点
         Ss = [S for S in Ss if np.hypot(*(S-G)) > 50]
         if len(Ss) < 2:
@@ -357,7 +452,7 @@ save_csv(exp_df, '问题一_随机实验比值.csv')
 # 汇总输出
 res_df = pd.DataFrame(results)
 save_csv(res_df, '问题一_结果汇总.csv')
-# 预处理数据.csv(问题一输出, 供后续问题共用: 示例场景检测数据+多边形结果)
+# 预设场景.csv 由本次随机场景实时生成（程序不读取任何外部场景文件）。
 sc_df = pd.DataFrame(scenario_rows)
 save_csv(sc_df, '问题一_场景明细.csv')
 prep_rows = []
@@ -370,8 +465,8 @@ for tag, G, Ss, Bs in [('A', G_A, S_A, B_A), ('B', G_B, S_B, B_B), ('C', G_C, S_
                               示向度=round(th,4), 真值x=round(G[0],2), 真值y=round(G[1],2),
                               多边形顶点数=len(poly), 定位区域直径=round(D,3), 最小包围圆半径=round(rstar,3)))
 prep_df = pd.DataFrame(prep_rows)
-prep_df.to_csv(os.path.join(BASE_DIR, '..', '预处理数据.csv'), index=False, encoding='utf-8-sig')
-print('预处理数据.csv 已输出')
+prep_df.to_csv(os.path.join(BASE_DIR, '预设场景.csv'), index=False, encoding='utf-8-sig')
+print(f'预设场景.csv 已根据本次随机场景生成: {os.path.join(BASE_DIR, "预设场景.csv")}')
 
 # 场景统计
 stats_print('场景直径', [r['D'] for r in results])
@@ -519,10 +614,10 @@ fig, ax = plt.subplots(figsize=(7, 5))
 eps = np.deg2rad(1.0)
 d1_list, ratio_list = [], []
 for _ in range(400):
-    G = np.array([rng.uniform(-1000, 1000), rng.uniform(-1000, 1000)])
-    d1 = rng.uniform(300, 1200)
-    phi = rng.uniform(np.deg2rad(25), np.deg2rad(150))
-    S1 = G - d1*uvec(rng.uniform(0, 360))
+    G = np.array([experiment_rng.uniform(-1000, 1000), experiment_rng.uniform(-1000, 1000)])
+    d1 = experiment_rng.uniform(300, 1200)
+    phi = experiment_rng.uniform(np.deg2rad(25), np.deg2rad(150))
+    S1 = G - d1*uvec(experiment_rng.uniform(0, 360))
     # 构造S2使交会角为phi、距离d2
     d2 = d1
     # S2方向: 从G出发与S1夹角phi
