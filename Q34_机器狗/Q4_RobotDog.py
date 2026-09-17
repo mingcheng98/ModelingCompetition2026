@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 机器狗程序(问题4): 全向+定向混合干扰源的自动搜索定位与清除
-与官方模拟器通信(HTTP+JSON)。
+直接运行时连接由 Simulator.py 准备的本地无端口会话；提供 --robot-id
+参数时仍按原方式连接官方 HTTP 模拟器。
 
 策略概要(在问题3基础上的扩展): 
   定向干扰源仅在定向方向±90°覆盖角内可被检测, 从背面完全无信号。
@@ -321,12 +322,32 @@ if __name__ == '__main__':
     import argparse
     program_start = time.perf_counter()
     parser = argparse.ArgumentParser(description='机器狗问题4策略')
-    parser.add_argument('--robot-id', required=True, help='参赛队号')
+    parser.add_argument('--robot-id', default=None,
+                        help='参赛队号；提供时连接官方HTTP模拟器，省略时使用本地会话')
     parser.add_argument('--base-url', default=BASE_URL, help=f'模拟器地址(默认: {BASE_URL})')
+    parser.add_argument('--log-dir', default=None,
+                        help='完整行为日志目录(本地模式默认写入系统临时目录)')
     args = parser.parse_args()
-    client = SimClient(base_url=args.base_url, robot_id=args.robot_id)
+    local_backend = None
+    if args.robot_id:
+        client = SimClient(base_url=args.base_url, robot_id=args.robot_id)
+    else:
+        from Simulator import FileLocalSimulator, session_path
+        try:
+            local_backend = FileLocalSimulator(session_path(4))
+        except FileNotFoundError:
+            parser.error('未找到Q4本地会话，请先运行 Simulator.py')
+        if local_backend.entered or local_backend.finished:
+            parser.error('Q4本地会话已经使用，请重新运行 Simulator.py 后再测试')
+        args.robot_id = local_backend.robot_id
+        client = SimClient(robot_id=args.robot_id, backend=local_backend)
     strat = StrategyQ4(client)
     s = strat.run()
+    if local_backend is not None:
+        truth = local_backend.truth_summary()
+        s['local_simulator'] = dict(source_count=truth['source_count'],
+                                    directional_count=truth['directional_count'],
+                                    all_cleared=all(item['cleared'] for item in truth['sources']))
     print(json.dumps(s, ensure_ascii=False, indent=2))
     elapsed = time.perf_counter() - program_start
     print(f'整段程序运行时间: {elapsed:.3f} 秒')
@@ -335,8 +356,10 @@ if __name__ == '__main__':
         import os
         s['actions'] = strat.trace['actions']
         s['program_run_time_s'] = elapsed
-        # 问题四日志独立保存到图表程序默认读取的 logs_q4 目录。
-        out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs_q4')
+        # 本地模拟写到会话的仓库外目录；官方 HTTP 模式保持原 logs_q4 默认值。
+        default_dir = (local_backend.log_dir if local_backend is not None else
+                       os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs_q4'))
+        out_dir = args.log_dir or default_dir
         os.makedirs(out_dir, exist_ok=True)
         out_path = os.path.join(out_dir, f'Q4_{args.robot_id}_{time.strftime("%Y%m%d_%H%M%S")}.json')
         with open(out_path, 'w', encoding='utf-8') as f:

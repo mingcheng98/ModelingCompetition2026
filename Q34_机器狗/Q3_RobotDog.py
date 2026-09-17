@@ -3,7 +3,8 @@
 机器狗程序(问题3): 全向干扰源的自动搜索定位与清除
 与官方模拟器通信(HTTP+JSON, 四条指令 /enter /measure /clear /exit), 
 也可对接自建模拟器(端口不同)。
-运行时通过 --robot-id 参数提供参赛队号。
+直接运行时连接由 Simulator.py 准备的本地无端口会话；提供 --robot-id
+参数时仍按原方式连接官方 HTTP 模拟器。
 
 策略概要: 
   第一阶段 覆盖扫描: 9个探测点(原点+原点两侧300米两点+半径1254.8米环形6点), 
@@ -44,12 +45,17 @@ def scan_grid():
 
 # ---------- HTTP 客户端 ----------
 class SimClient:
-    """官方协议客户端: 带重试的POST, 校验accepted"""
-    def __init__(self, base_url=BASE_URL, robot_id=None):
+    """官方协议客户端，也支持注入本地后端进行无网络测试。
+
+    ``backend`` 只需提供 ``post(path, payload)`` 方法并返回协议响应，
+    这样策略无需修改即可接入本地模拟器；未提供时仍使用官方 HTTP 接口。
+    """
+    def __init__(self, base_url=BASE_URL, robot_id=None, backend=None):
         if not robot_id:
             raise ValueError('必须提供参赛队号 robot_id')
         self.base_url = base_url
         self.robot_id = robot_id
+        self.backend = backend
         self.req_seq = 0
         self.log = []          # 请求/响应日志
         self.move_t = 0.0      # 移动耗时
@@ -63,6 +69,16 @@ class SimClient:
 
     def _post(self, path, payload, retries=6):
         self.req_seq += 1
+        if self.backend is not None:
+            resp = self.backend.post(path, payload)
+            if resp is None:
+                raise RuntimeError(f'{path} 本地模拟器未返回响应')
+            self.log.append(dict(path=path, payload=str(payload), resp=str(resp),
+                                 virtual_time=resp.get('virtual_time_s', 0)))
+            if not resp.get('accepted', False):
+                raise RuntimeError(f'{path} 未执行: {resp}')
+            self.virtual_time = float(resp['virtual_time_s'])
+            return resp
         data = json.dumps(payload).encode('utf-8')
         for att in range(retries):
             try:
@@ -563,12 +579,32 @@ if __name__ == '__main__':
     import argparse
     program_start = time.perf_counter()
     parser = argparse.ArgumentParser(description='机器狗问题3策略')
-    parser.add_argument('--robot-id', required=True, help='参赛队号')
+    parser.add_argument('--robot-id', default=None,
+                        help='参赛队号；提供时连接官方HTTP模拟器，省略时使用本地会话')
     parser.add_argument('--base-url', default=BASE_URL, help=f'模拟器地址(默认: {BASE_URL})')
+    parser.add_argument('--log-dir', default=None,
+                        help='完整行为日志目录(本地模式默认写入系统临时目录)')
     args = parser.parse_args()
-    client = SimClient(base_url=args.base_url, robot_id=args.robot_id)
+    local_backend = None
+    if args.robot_id:
+        client = SimClient(base_url=args.base_url, robot_id=args.robot_id)
+    else:
+        from Simulator import FileLocalSimulator, session_path
+        try:
+            local_backend = FileLocalSimulator(session_path(3))
+        except FileNotFoundError:
+            parser.error('未找到Q3本地会话，请先运行 Simulator.py')
+        if local_backend.entered or local_backend.finished:
+            parser.error('Q3本地会话已经使用，请重新运行 Simulator.py 后再测试')
+        args.robot_id = local_backend.robot_id
+        client = SimClient(robot_id=args.robot_id, backend=local_backend)
     strat = StrategyQ3(client)
     s = strat.run()
+    if local_backend is not None:
+        truth = local_backend.truth_summary()
+        s['local_simulator'] = dict(source_count=truth['source_count'],
+                                    directional_count=truth['directional_count'],
+                                    all_cleared=all(item['cleared'] for item in truth['sources']))
     print(json.dumps(s, ensure_ascii=False, indent=2))
     elapsed = time.perf_counter() - program_start
     print(f'整段程序运行时间: {elapsed:.3f} 秒')
@@ -576,8 +612,10 @@ if __name__ == '__main__':
     try:
         s['actions'] = strat.trace['actions']
         s['program_run_time_s'] = elapsed
-        # 问题三日志独立保存到图表程序默认读取的 logs_q3 目录。
-        out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs_q3')
+        # 本地模拟写到会话的仓库外目录；官方 HTTP 模式保持原 logs_q3 默认值。
+        default_dir = (local_backend.log_dir if local_backend is not None else
+                       os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs_q3'))
+        out_dir = args.log_dir or default_dir
         os.makedirs(out_dir, exist_ok=True)
         out_path = os.path.join(out_dir, f'Q3_{args.robot_id}_{time.strftime("%Y%m%d_%H%M%S")}.json')
         with open(out_path, 'w', encoding='utf-8') as f:
