@@ -1,8 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 机器狗程序(问题4): 全向+定向混合干扰源的自动搜索定位与清除
-直接运行时连接由 Simulator.py 准备的本地无端口会话；提供 --robot-id
-参数时仍按原方式连接官方 HTTP 模拟器。
+程序通过 Simulator.py 准备的本地会话运行。
 
 策略概要(在问题3基础上的扩展): 
   定向干扰源仅在定向方向±90°覆盖角内可被检测, 从背面完全无信号。
@@ -20,9 +19,7 @@ import time
 import os
 import json
 from Q3_RobotDog import (SimClient, StrategyQ3, localization_polygon, poly_centroid,
-                          poly_diameter, best_cross_sin, GOOD_SIN, PROBE_T, PROBE_L)
-
-BASE_URL = 'http://127.0.0.1:2026'
+                          poly_diameter, PROBE_T, PROBE_L)
 
 SURVEY_RING_RADIUS = 40.0  # 环形探测基础半径(米)
 
@@ -318,29 +315,20 @@ class StrategyQ4(StrategyQ3):
         self._walk_kill(ch, (ex, ey), None, bound, t_kill)
 
 if __name__ == '__main__':
-    import json
     import argparse
     program_start = time.perf_counter()
     parser = argparse.ArgumentParser(description='机器狗问题4策略')
-    parser.add_argument('--robot-id', default=None,
-                        help='参赛队号；提供时连接官方HTTP模拟器，省略时使用本地会话')
-    parser.add_argument('--base-url', default=BASE_URL, help=f'模拟器地址(默认: {BASE_URL})')
     parser.add_argument('--log-dir', default=None,
-                        help='完整行为日志目录(本地模式默认写入系统临时目录)')
+                        help='完整行为日志目录（默认写入本地会话目录）')
     args = parser.parse_args()
-    local_backend = None
-    if args.robot_id:
-        client = SimClient(base_url=args.base_url, robot_id=args.robot_id)
-    else:
-        from Simulator import FileLocalSimulator, session_path
-        try:
-            local_backend = FileLocalSimulator(session_path(4))
-        except FileNotFoundError:
-            parser.error('未找到Q4本地会话，请先运行 Simulator.py')
-        if local_backend.entered or local_backend.finished:
-            parser.error('Q4本地会话已经使用，请重新运行 Simulator.py 后再测试')
-        args.robot_id = local_backend.robot_id
-        client = SimClient(robot_id=args.robot_id, backend=local_backend)
+    from Simulator import FileLocalSimulator, session_path
+    try:
+        local_backend = FileLocalSimulator(session_path(4))
+    except FileNotFoundError:
+        parser.error('未找到Q4本地会话，请先运行 Simulator.py')
+    if local_backend.entered or local_backend.finished:
+        parser.error('Q4本地会话已经使用，请重新运行 Simulator.py 后再测试')
+    client = SimClient(local_backend)
     strat = StrategyQ4(client)
     s = strat.run()
     if local_backend is not None:
@@ -353,15 +341,13 @@ if __name__ == '__main__':
     print(f'整段程序运行时间: {elapsed:.3f} 秒')
     # ---- 自动保存完整日志(含动作轨迹), 供绘图程序使用; 保存失败不影响测试 ----
     try:
-        import os
         s['actions'] = strat.trace['actions']
         s['program_run_time_s'] = elapsed
-        # 本地模拟写到会话的仓库外目录；官方 HTTP 模式保持原 logs_q4 默认值。
-        default_dir = (local_backend.log_dir if local_backend is not None else
-                       os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs_q4'))
+        # 本地模拟写到会话的仓库外目录。
+        default_dir = local_backend.log_dir
         out_dir = args.log_dir or default_dir
         os.makedirs(out_dir, exist_ok=True)
-        out_path = os.path.join(out_dir, f'Q4_{args.robot_id}_{time.strftime("%Y%m%d_%H%M%S")}.json')
+        out_path = os.path.join(out_dir, f'Q4_{time.strftime("%Y%m%d_%H%M%S")}.json')
         with open(out_path, 'w', encoding='utf-8') as f:
             json.dump(s, f, ensure_ascii=False, indent=2)
         print(f'完整日志已保存: {out_path}')

@@ -1,10 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-机器狗程序(问题3): 全向干扰源的自动搜索定位与清除
-与官方模拟器通信(HTTP+JSON, 四条指令 /enter /measure /clear /exit), 
-也可对接自建模拟器(端口不同)。
-直接运行时连接由 Simulator.py 准备的本地无端口会话；提供 --robot-id
-参数时仍按原方式连接官方 HTTP 模拟器。
+机器狗程序(问题3): 全向干扰源的自动搜索定位与清除。
+程序通过 Simulator.py 准备的本地会话运行。
 
 策略概要: 
   第一阶段 覆盖扫描: 9个探测点(原点+原点两侧300米两点+半径1254.8米环形6点), 
@@ -17,20 +14,14 @@
     失败则沿测得示向线步进并逐点尝试清除("near"直接清除), 直至成功。
 """
 import json
+import math
 import os
 import time
-import math
-import sys
-from urllib.request import Request, urlopen
-from urllib.error import URLError, HTTPError
 
 # ---------- 配置 ----------
-BASE_URL = 'http://127.0.0.1:2026'
 SPEED = 5.0                       # 移动速度(米/秒)
-SCAN_R = 950.0                    # 覆盖裕量(<1000)
 RING_R = 1254.8                   # 环形扫描半径
 CENTER_OFF = 300.0                # 原点两侧辅助探测点偏移
-GOOD_SIN = 0.35                   # 交会角质量阈值
 LOCALIZATION_QUALITY_THRESHOLD = 200.0  # 定位质量阈值(交会多边形直径, 米)
 PROBE_T = 500.0                   # 补测点沿示向线偏移
 PROBE_L = 500.0                   # 补测点垂直偏移
@@ -43,18 +34,12 @@ def scan_grid():
         pts.append((RING_R*math.cos(a), RING_R*math.sin(a)))
     return pts
 
-# ---------- HTTP 客户端 ----------
+# ---------- 本地模拟器客户端 ----------
 class SimClient:
-    """官方协议客户端，也支持注入本地后端进行无网络测试。
-
-    ``backend`` 只需提供 ``post(path, payload)`` 方法并返回协议响应，
-    这样策略无需修改即可接入本地模拟器；未提供时仍使用官方 HTTP 接口。
-    """
-    def __init__(self, base_url=BASE_URL, robot_id=None, backend=None):
-        if not robot_id:
-            raise ValueError('必须提供参赛队号 robot_id')
-        self.base_url = base_url
-        self.robot_id = robot_id
+    """连接本地模拟器后端的轻量客户端。"""
+    def __init__(self, backend):
+        if backend is None:
+            raise ValueError('必须提供本地模拟器后端')
         self.backend = backend
         self.req_seq = 0
         self.log = []          # 请求/响应日志
@@ -67,40 +52,13 @@ class SimClient:
         self.pos = (0.0, 0.0)
         self.channel = 1
 
-    def _post(self, path, payload, retries=6):
+    def _post(self, path, payload=None):
         self.req_seq += 1
-        if self.backend is not None:
-            resp = self.backend.post(path, payload)
-            if resp is None:
-                raise RuntimeError(f'{path} 本地模拟器未返回响应')
-            self.log.append(dict(path=path, payload=str(payload), resp=str(resp),
-                                 virtual_time=resp.get('virtual_time_s', 0)))
-            if not resp.get('accepted', False):
-                raise RuntimeError(f'{path} 未执行: {resp}')
-            self.virtual_time = float(resp['virtual_time_s'])
-            return resp
-        data = json.dumps(payload).encode('utf-8')
-        for att in range(retries):
-            try:
-                req = Request(self.base_url + path, data=data,
-                              headers={'Content-Type': 'application/json'}, method='POST')
-                with urlopen(req, timeout=10) as r:
-                    resp = json.loads(r.read().decode('utf-8'))
-                    break
-            except (URLError, HTTPError, TimeoutError, OSError) as e:
-                if isinstance(e, HTTPError):
-                    try:
-                        resp = json.loads(e.read().decode('utf-8'))
-                        break
-                    except Exception:
-                        resp = None
-                time.sleep(0.2*(att+1))
-                resp = None
-        else:
-            resp = None
+        request = dict(payload or {}, request_id=f'req-{self.req_seq}')
+        resp = self.backend.post(path, request)
         if resp is None:
-            raise RuntimeError(f'{path} 请求失败')
-        self.log.append(dict(path=path, payload=str(payload), resp=str(resp),
+            raise RuntimeError(f'{path} 本地模拟器未返回响应')
+        self.log.append(dict(path=path, payload=str(request), resp=str(resp),
                              virtual_time=resp.get('virtual_time_s', 0)))
         if not resp.get('accepted', False):
             raise RuntimeError(f'{path} 未执行: {resp}')
@@ -108,17 +66,14 @@ class SimClient:
         return resp
 
     def enter(self):
-        r = self._post('/enter', dict(arena_id='default', robot_id=self.robot_id,
-                                      request_id=f'e{self.req_seq}'))
+        r = self._post('/enter')
         self.remaining_real = r['remaining_real_duration_s']
         return r
 
     def measure(self, x, y, ch):
         move_t = math.hypot(x-self.pos[0], y-self.pos[1])/SPEED
         switch_t = 1.0 if ch != self.channel else 0.0
-        r = self._post('/measure', dict(arena_id='default', robot_id=self.robot_id,
-                                        request_id=f'm{self.req_seq}',
-                                        position={'x': x, 'y': y}, channel=ch))
+        r = self._post('/measure', dict(position={'x': x, 'y': y}, channel=ch))
         self.pos = (x, y)
         self.channel = ch
         self.move_t += move_t
@@ -128,9 +83,7 @@ class SimClient:
 
     def clear(self, x, y, ch):
         move_t = math.hypot(x-self.pos[0], y-self.pos[1])/SPEED
-        r = self._post('/clear', dict(arena_id='default', robot_id=self.robot_id,
-                                      request_id=f'c{self.req_seq}',
-                                      position={'x': x, 'y': y}, channel=ch))
+        r = self._post('/clear', dict(position={'x': x, 'y': y}, channel=ch))
         self.pos = (x, y)
         self.move_t += move_t
         if r.get('clear_result') == 'success':
@@ -140,8 +93,7 @@ class SimClient:
         return r, move_t
 
     def exit(self):
-        r = self._post('/exit', dict(arena_id='default', robot_id=self.robot_id,
-                                     request_id=f'x{self.req_seq}'))
+        r = self._post('/exit')
         return r
 
 # ---------- 几何工具 ----------
@@ -205,20 +157,6 @@ def poly_diameter(verts):
         for j in range(i+1, n):
             d = math.hypot(verts[i][0]-verts[j][0], verts[i][1]-verts[j][1])
             best = max(best, d)
-    return best
-
-def best_cross_sin(bearings):
-    """两两示向线的交会角正弦最大值(>GOOD_SIN认为交会良好)"""
-    best = 0.0
-    n = len(bearings)
-    for i in range(n):
-        for j in range(i+1, n):
-            P = _line_intersect(bearings[i], bearings[j])
-            if P is None:
-                continue
-            a1 = math.atan2(P[1]-bearings[i][1], P[0]-bearings[i][0])
-            a2 = math.atan2(P[1]-bearings[j][1], P[0]-bearings[j][0])
-            best = max(best, abs(math.sin(a1-a2)))
     return best
 
 def _line_intersect(b1, b2):
@@ -579,25 +517,17 @@ if __name__ == '__main__':
     import argparse
     program_start = time.perf_counter()
     parser = argparse.ArgumentParser(description='机器狗问题3策略')
-    parser.add_argument('--robot-id', default=None,
-                        help='参赛队号；提供时连接官方HTTP模拟器，省略时使用本地会话')
-    parser.add_argument('--base-url', default=BASE_URL, help=f'模拟器地址(默认: {BASE_URL})')
     parser.add_argument('--log-dir', default=None,
-                        help='完整行为日志目录(本地模式默认写入系统临时目录)')
+                        help='完整行为日志目录（默认写入本地会话目录）')
     args = parser.parse_args()
-    local_backend = None
-    if args.robot_id:
-        client = SimClient(base_url=args.base_url, robot_id=args.robot_id)
-    else:
-        from Simulator import FileLocalSimulator, session_path
-        try:
-            local_backend = FileLocalSimulator(session_path(3))
-        except FileNotFoundError:
-            parser.error('未找到Q3本地会话，请先运行 Simulator.py')
-        if local_backend.entered or local_backend.finished:
-            parser.error('Q3本地会话已经使用，请重新运行 Simulator.py 后再测试')
-        args.robot_id = local_backend.robot_id
-        client = SimClient(robot_id=args.robot_id, backend=local_backend)
+    from Simulator import FileLocalSimulator, session_path
+    try:
+        local_backend = FileLocalSimulator(session_path(3))
+    except FileNotFoundError:
+        parser.error('未找到Q3本地会话，请先运行 Simulator.py')
+    if local_backend.entered or local_backend.finished:
+        parser.error('Q3本地会话已经使用，请重新运行 Simulator.py 后再测试')
+    client = SimClient(local_backend)
     strat = StrategyQ3(client)
     s = strat.run()
     if local_backend is not None:
@@ -612,12 +542,11 @@ if __name__ == '__main__':
     try:
         s['actions'] = strat.trace['actions']
         s['program_run_time_s'] = elapsed
-        # 本地模拟写到会话的仓库外目录；官方 HTTP 模式保持原 logs_q3 默认值。
-        default_dir = (local_backend.log_dir if local_backend is not None else
-                       os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs_q3'))
+        # 本地模拟写到会话的仓库外目录。
+        default_dir = local_backend.log_dir
         out_dir = args.log_dir or default_dir
         os.makedirs(out_dir, exist_ok=True)
-        out_path = os.path.join(out_dir, f'Q3_{args.robot_id}_{time.strftime("%Y%m%d_%H%M%S")}.json')
+        out_path = os.path.join(out_dir, f'Q3_{time.strftime("%Y%m%d_%H%M%S")}.json')
         with open(out_path, 'w', encoding='utf-8') as f:
             json.dump(s, f, ensure_ascii=False, indent=2)
         print(f'完整日志已保存: {out_path}')

@@ -1,9 +1,8 @@
 # -*- coding: utf-8 -*-
 """本地机器狗模拟器。
 
-本文件不启动 HTTP 服务，也不监听任何网络端口。它在当前 Python 进程内
-实现附件 1/2 中约定的 ``/enter``、``/measure``、``/clear``、``/exit``
-四个动作，并把本地后端注入现有 Q3/Q4 策略的 ``SimClient``。
+本文件在当前 Python 进程内实现 ``/enter``、``/measure``、``/clear``、
+``/exit`` 四个动作，并把本地后端注入 Q3/Q4 策略的 ``SimClient``。
 
 用法（在仓库根目录或本目录均可）：
 
@@ -12,8 +11,6 @@
     python Q34_机器狗/Q4_RobotDog.py
 
 第一条命令准备本地 Q3/Q4 会话，随后直接运行任一机器狗程序即可测试。
-全程不监听网络端口，也不要求输入队伍编号。程序会自动生成一个内部编号，
-仅用于保持协议字段完整和复现本次随机案例。
 """
 from __future__ import annotations
 
@@ -23,11 +20,9 @@ import hashlib
 import json
 import math
 import random
-import re
 import sys
 import tempfile
 import time
-import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -84,22 +79,22 @@ def _angle_diff(a: float, b: float) -> float:
     return abs((a - b + 180.0) % 360.0 - 180.0)
 
 
-def _stable_seed(robot_id: str, question: int) -> int:
-    digest = hashlib.sha256(f"{question}:{robot_id}".encode("utf-8")).digest()
+def _stable_seed(seed: int, question: int) -> int:
+    """根据会话种子和题号生成稳定的随机种子。"""
+    digest = hashlib.sha256(f"{question}:{seed}".encode("ascii")).digest()
     return int.from_bytes(digest[:8], "big")
 
 
-def _has_forbidden_chars(value: str) -> bool:
-    return any(unicodedata.category(ch) in {"Cc", "Cf"} for ch in value)
+def _has_control_chars(value: str) -> bool:
+    return any(ord(ch) < 32 or ord(ch) == 127 for ch in value)
 
 
-def _generate_sources(robot_id: str, question: int) -> List[InterferenceSource]:
-    """按队伍编号稳定生成一局案例，且保证扫描网格至少能听到每个源。
+def _generate_sources(seed: int, question: int) -> List[InterferenceSource]:
+    """生成一局案例，并保证扫描网格至少能听到每个源。
 
-    正式模拟器的案例是随机的；本地版本用队伍编号作种子，便于复现实验，
-    但不把源真值返回给机器狗策略。
+    使用会话种子复现实验，但不把源真值返回给机器狗策略。
     """
-    rng = random.Random(_stable_seed(robot_id, question))
+    rng = random.Random(_stable_seed(seed, question))
     count = rng.randint(10, 16)
     channels = rng.sample(range(1, 21), count)
     grid = scan_grid() if question == 3 else scan_grid_q4()
@@ -130,16 +125,15 @@ def _generate_sources(robot_id: str, question: int) -> List[InterferenceSource]:
 
 
 class LocalSimulator:
-    """进程内协议后端，接口形状与 HTTP 业务响应一致。"""
+    """进程内协议后端，供 Q3/Q4 策略直接调用。"""
 
-    def __init__(self, robot_id: str, question: int, sources: Optional[Iterable[InterferenceSource]] = None):
-        if (not robot_id or _has_forbidden_chars(robot_id)
-                or not 1 <= len(robot_id.encode("utf-8")) <= 64):
-            raise ValueError("robot_id 长度必须为 1 至 64 字节且不能包含控制字符")
-        self.robot_id = robot_id
+    def __init__(self, question: int, sources: Optional[Iterable[InterferenceSource]] = None,
+                 seed: Optional[int] = None):
+        if question not in (3, 4):
+            raise ValueError("question 必须为 3 或 4")
         self.question = question
-        self.seed = _stable_seed(robot_id, question)
-        self.sources = list(sources) if sources is not None else _generate_sources(robot_id, question)
+        self.seed = int(seed if seed is not None else random.SystemRandom().getrandbits(64))
+        self.sources = list(sources) if sources is not None else _generate_sources(self.seed, question)
         self.position = (0.0, 0.0)
         self.channel = 1
         self.virtual_time = 0.0
@@ -181,16 +175,12 @@ class LocalSimulator:
     def _validate_base(self, payload: dict, required: set) -> Optional[str]:
         if not isinstance(payload, dict):
             return "请求体必须是 JSON 对象"
-        allowed = {"arena_id", "robot_id", "request_id"} | required
+        allowed = {"request_id"} | required
         if set(payload) - allowed:
             return "请求包含未声明字段"
-        if payload.get("arena_id") != "default":
-            return "arena_id 不匹配"
-        if payload.get("robot_id") != self.robot_id:
-            return "robot_id 不匹配"
         request_id = payload.get("request_id")
         if (not isinstance(request_id, str) or not request_id
-                or _has_forbidden_chars(request_id)
+                or _has_control_chars(request_id)
                 or len(request_id.encode("utf-8")) > 128):
             return "request_id 不合法"
         return None
@@ -362,7 +352,6 @@ class LocalSimulator:
         """将会话状态序列化，供跨进程的本地 Q3/Q4 程序继续执行。"""
         return {
             "version": 1,
-            "robot_id": self.robot_id,
             "question": self.question,
             "seed": self.seed,
             "position": list(self.position),
@@ -380,8 +369,8 @@ class LocalSimulator:
     @classmethod
     def from_state(cls, state: dict) -> "LocalSimulator":
         sources = [InterferenceSource(**item) for item in state.get("sources", [])]
-        obj = cls(state["robot_id"], int(state["question"]), sources=sources)
-        obj.seed = int(state.get("seed", obj.seed))
+        obj = cls(int(state["question"]), sources=sources,
+                  seed=int(state.get("seed", 0)))
         obj.position = tuple(state.get("position", (0.0, 0.0)))
         obj.channel = int(state.get("channel", 1))
         obj.virtual_time = float(state.get("virtual_time", 0.0))
@@ -432,7 +421,7 @@ class FileLocalSimulator(LocalSimulator):
         return super().truth_summary()
 
 
-def prepare_sessions(robot_id: str = "LOCAL-TEAM", question: str = "both") -> dict:
+def prepare_sessions(question: str = "both") -> dict:
     """生成 Q3/Q4 本地会话文件，供随后单击运行机器狗程序。"""
     if question not in {"3", "4", "both"}:
         raise ValueError("question 必须为 3、4 或 both")
@@ -442,7 +431,7 @@ def prepare_sessions(robot_id: str = "LOCAL-TEAM", question: str = "both") -> di
     questions = [3, 4] if question == "both" else [int(question)]
     prepared = {}
     for q in questions:
-        backend = LocalSimulator(robot_id, q)
+        backend = LocalSimulator(q)
         state = backend.state_dict()
         state.update({"status": "ready", "log_dir": str(run_dir)})
         path = session_path(q)
@@ -454,34 +443,29 @@ def prepare_sessions(robot_id: str = "LOCAL-TEAM", question: str = "both") -> di
     return prepared
 
 
-def _run_one(robot_id: str, question: int, run_dir: Path) -> dict:
-    backend = LocalSimulator(robot_id, question)
+def _run_one(question: int, run_dir: Path) -> dict:
+    backend = LocalSimulator(question)
     strategy_cls = StrategyQ3 if question == 3 else StrategyQ4
-    client = SimClient(robot_id=robot_id, backend=backend)
+    client = SimClient(backend)
     started = time.perf_counter()
     strategy = strategy_cls(client)
     summary = strategy.run()
     elapsed = time.perf_counter() - started
     result = dict(summary)
-    result.update({"question": question, "robot_id": robot_id,
+    result.update({"question": question,
                    "program_run_time_s": round(elapsed, 6),
-                   "simulator": "in_process", "network_port": None,
+                   "simulator": "in_process",
                    "actions": strategy.trace["actions"],
                    "protocol_actions": backend.actions,
                    "truth": backend.truth_summary()})
-    safe_robot_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", robot_id).strip("._") or "team"
-    out_path = run_dir / f"Q{question}_{safe_robot_id}_{int(time.time() * 1000)}.json"
+    out_path = run_dir / f"Q{question}_{int(time.time() * 1000)}.json"
     out_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     result["log_path"] = str(out_path)
     return result
 
 
-def run_simulation(robot_id: str, question: str = "both", log_dir: Optional[Path] = None) -> List[dict]:
+def run_simulation(question: str = "both", log_dir: Optional[Path] = None) -> List[dict]:
     """运行 Q3、Q4 或指定问题，返回汇总结果列表。"""
-    if not robot_id or not robot_id.strip():
-        raise ValueError("必须提供队伍编号")
-    if _has_forbidden_chars(robot_id):
-        raise ValueError("队伍编号不能包含控制字符")
     if question not in {"3", "4", "both"}:
         raise ValueError("question 必须为 3、4 或 both")
     if log_dir is None:
@@ -489,13 +473,11 @@ def run_simulation(robot_id: str, question: str = "both", log_dir: Optional[Path
     log_dir = Path(log_dir).resolve()
     log_dir.mkdir(parents=True, exist_ok=True)
     questions = [3, 4] if question == "both" else [int(question)]
-    return [_run_one(robot_id.strip(), q, log_dir) for q in questions]
+    return [_run_one(q, log_dir) for q in questions]
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="初始化无网络端口的 Q3/Q4 本地模拟会话")
-    parser.add_argument("robot_id", nargs="?", default=None,
-                        help="可选队伍编号；省略时自动生成，无需输入")
+    parser = argparse.ArgumentParser(description="初始化 Q3/Q4 本地模拟会话")
     parser.add_argument("--question", choices=("3", "4", "both"), default="both",
                         help="准备问题3、问题4或两者(默认: both)")
     parser.add_argument("--log-dir", type=Path, default=None,
@@ -503,21 +485,20 @@ def main() -> int:
     parser.add_argument("--run", action="store_true",
                         help="兼容旧版：准备后立即运行策略；默认只准备会话")
     args = parser.parse_args()
-    robot_id = args.robot_id or f"LOCAL-{time.strftime('%Y%m%d-%H%M%S')}-{time.time_ns() % 1000000:06d}"
     try:
         if args.run:
-            results = run_simulation(robot_id, args.question, args.log_dir)
+            results = run_simulation(args.question, args.log_dir)
             for result in results:
                 total = result["truth"]["source_count"]
-                print(f"Q{result['question']}  队伍 {result['robot_id']}: "
-                      f"清除 {result['cleared']}/{total} 个，虚拟用时 {result['total_time']:.2f} s")
+                print(f"Q{result['question']}  清除 {result['cleared']}/{total} 个，"
+                      f"虚拟用时 {result['total_time']:.2f} s")
                 print(f"日志(仓库外): {result['log_path']}")
             return 0
-        prepared = prepare_sessions(robot_id, args.question)
+        prepared = prepare_sessions(args.question)
     except Exception as exc:
         print(f"模拟失败: {exc}", file=sys.stderr)
         return 1
-    print(f"本地模拟会话已准备，内部编号: {robot_id}")
+    print("本地模拟会话已准备。")
     for name, info in prepared.items():
         print(f"{name.upper()} 可直接运行；日志目录(仓库外): {info['log_dir']}")
     return 0
